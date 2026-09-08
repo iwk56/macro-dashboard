@@ -20,6 +20,7 @@ import streamlit as st
 
 import cases
 import drivers
+import event_calendar
 import layer2_rolling_corr as l2
 import news_engine
 import notes_store
@@ -97,11 +98,12 @@ with st.sidebar:
 
 st.title("채권·금리 매크로 대시보드")
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📌 2s10s 플래그십 분석",
     "📊 요인별 이론-실증 카드",
     "📰 뉴스 분석",
     "🗂️ 예시·기록",
+    "🗓️ 향후 이벤트",
 ])
 
 # ===== 탭 1 : 2s10s 스프레드 =====
@@ -562,3 +564,63 @@ with tab4:
             file_name=f"macro_notes_{dt.date.today().isoformat()}.md",
             mime="text/markdown",
         )
+
+# ===== 탭 5 : 향후 이벤트 (레이어 3) =====
+with tab5:
+    st.caption(
+        "채권 금리에 직접 영향을 주는 4가지 정기 이벤트(FOMC, CPI, 고용보고서, GDP)의 "
+        "예정된 일정입니다. 실시간 자동 수집 대신, 연준·BLS·BEA 공식 발표 자료를 직접 "
+        "확인해서 정리해둔 표예요 — 크롤링이 조용히 깨져서 틀린 날짜를 보여주는 사고를 "
+        "막기 위한 선택입니다. 아래 출처에서 새 일정이 나오면 event_calendar.py만 "
+        "업데이트하면 돼요."
+    )
+
+    upcoming = event_calendar.upcoming_events()
+
+    if not upcoming:
+        st.info("정리된 예정 이벤트가 없어요. event_calendar.py에 새 일정을 추가해주세요.")
+    else:
+        next_event = upcoming[0]
+        days_left = (next_event["date"] - dt.date.today()).days
+
+        with st.container(border=True):
+            st.markdown("#### ⏭️ 다음 이벤트")
+            c1, c2, c3 = st.columns([2, 1, 3])
+            c1.metric(f"{next_event['icon']} {next_event['title']}", next_event["date"].strftime("%Y-%m-%d"))
+            c2.metric("D-day", f"D-{days_left}" if days_left > 0 else "D-DAY")
+            with c3:
+                st.write(next_event["detail"])
+                st.caption(f"💡 {next_event['driver_link']}")
+
+        st.divider()
+        st.markdown("### 📋 예정된 전체 일정")
+
+        rows = []
+        for e in upcoming:
+            date_str = e["date"].strftime("%Y-%m-%d")
+            if e.get("end_date"):
+                date_str += f" ~ {e['end_date'].strftime('%m-%d')}"
+            d = (e["date"] - dt.date.today()).days
+            rows.append({
+                "날짜": date_str,
+                "D-day": f"D-{d}" if d > 0 else "D-DAY",
+                "이벤트": f"{e['icon']} {e['title']}",
+                "설명": e["detail"],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        with st.expander("📖 각 이벤트가 요인 카드와 어떻게 연결되는지"):
+            seen_kinds = set()
+            for e in upcoming:
+                if e["kind"] not in seen_kinds:
+                    seen_kinds.add(e["kind"])
+                    st.markdown(f"- **{e['icon']} {e['title']}**: {e['driver_link']}")
+
+    st.caption(
+        "출처: "
+        "[연준 FOMC 일정](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm) · "
+        "[BLS CPI](https://www.bls.gov/schedule/news_release/cpi.htm) · "
+        "[BLS 고용보고서](https://www.bls.gov/schedule/news_release/empsit.htm) · "
+        "[BEA GDP](https://www.bea.gov/news/schedule)  \n"
+        "마지막 확인일: 2026-09-08"
+    )
