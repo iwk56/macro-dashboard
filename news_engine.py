@@ -18,6 +18,8 @@ API 키는 절대 코드에 하드코딩하지 않는다. Streamlit Cloud의 "Se
 
 from __future__ import annotations
 
+import json
+
 import streamlit as st
 
 # 웹 검색을 지원하는 것으로 확인된 모델 후보 (비용 낮은 순).
@@ -83,3 +85,74 @@ def summarize_recent_news(topic: str, model: str, api_key: str) -> tuple[str, li
             seen.add(s["url"])
             unique_sources.append(s)
     return summary, unique_sources
+
+
+ANALYSIS_SCHEMA_KEYS = ["summary", "terms", "why_it_matters", "impact_on_target", "future_scenarios"]
+
+
+def analyze_article(
+    article_text: str,
+    target_name: str,
+    model: str,
+    api_key: str,
+    use_web_search: bool = False,
+) -> dict:
+    """사용자가 붙여넣은 기사(글) 원문을 분석해 구조화된 결과를 반환한다.
+
+    반환 딕셔너리 키: summary, terms(list[{term, definition}]),
+    why_it_matters, impact_on_target, future_scenarios.
+    파싱에 실패하면 "_parse_error": True 와 함께 원문 텍스트를 summary에 담아 반환한다
+    (요약 자체는 항상 사용자에게 보여줄 수 있게).
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    json_template = """{
+  "summary": "3~5문장 한국어 요약",
+  "terms": [{"term": "기사에 나온 전문용어", "definition": "이 문맥에서의 뜻을 쉬운 말로"}],
+  "why_it_matters": "이 이슈가 왜 중요한지 2~4문장",
+  "impact_on_target": "이 글의 내용이 '__TARGET__'에 어떤 영향을 주는지, 가능하면 교과서적 이론(방향/메커니즘)까지 포함해서 설명",
+  "future_scenarios": "이 글을 바탕으로 앞으로 주목해야 할 이벤트나 가능한 시나리오 2~3가지"
+}"""
+    json_template = json_template.replace("__TARGET__", target_name)
+
+    prompt = (
+        "다음은 사용자가 읽은 뉴스 기사(또는 글)의 원문이야. 이 글을 분석해서 "
+        "아래 형식의 JSON 객체 하나만 출력해줘. 코드블록 표시나 다른 설명 문장 "
+        "없이 순수 JSON만 출력해야 해.\n\n"
+        f"{json_template}\n\n"
+        f'기사 원문:\n"""\n{article_text}\n"""'
+    )
+
+    kwargs = dict(model=model, max_tokens=1500, messages=[{"role": "user", "content": prompt}])
+    if use_web_search:
+        kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
+
+    response = client.messages.create(**kwargs)
+
+    raw = "\n".join(
+        block.text for block in response.content if getattr(block, "type", None) == "text"
+    ).strip()
+
+    cleaned = raw
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
+    try:
+        result = json.loads(cleaned)
+        for key in ANALYSIS_SCHEMA_KEYS:
+            result.setdefault(key, "" if key != "terms" else [])
+        return result
+    except Exception:
+        return {
+            "summary": raw or "분석 결과를 해석하지 못했습니다.",
+            "terms": [],
+            "why_it_matters": "",
+            "impact_on_target": "",
+            "future_scenarios": "",
+            "_parse_error": True,
+        }

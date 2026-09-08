@@ -11,6 +11,7 @@
 """
 
 import datetime as dt
+import json
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,7 @@ import cases
 import drivers
 import layer2_rolling_corr as l2
 import news_engine
+import notes_store
 from fetch_and_analyze_2s10s import build_lag_table, find_episodes
 
 st.set_page_config(page_title="채권·금리 매크로 대시보드", layout="wide")
@@ -262,60 +264,261 @@ with tab2:
         chosen_label = st.selectbox("살펴볼 요인을 선택하세요", list(driver_labels.keys()))
         render_driver_card(drivers.get_driver(driver_labels[chosen_label]))
 
+def anthropic_key_setup_block(key_suffix: str = "default") -> None:
+    with st.container(border=True):
+        st.markdown("#### 🔑 Anthropic API 키가 필요해요")
+        st.write(
+            "1. [console.anthropic.com](https://console.anthropic.com) 에서 계정을 만들고 "
+            "'Get API Keys' 메뉴에서 키를 발급받으세요 (`sk-ant-`로 시작).\n\n"
+            "2. Streamlit Cloud에 배포한 앱이라면, 앱 관리 화면(Manage app) → "
+            "**Settings → Secrets** 에 아래처럼 등록하면 이 입력창 없이 자동으로 "
+            "사용됩니다:\n\n"
+            "```\nANTHROPIC_API_KEY = \"sk-ant-여기에-실제-키\"\n```\n\n"
+            "3. 아니면 아래에 임시로 입력해서 지금 세션에서만 테스트해볼 수도 있어요 "
+            "(새로고침하면 사라지고, 어디에도 저장되지 않습니다)."
+        )
+        typed_key = st.text_input(
+            "Anthropic API 키 (임시, 이번 세션에만 사용)", type="password",
+            key=f"anthropic_key_typed_{key_suffix}",
+        )
+        if typed_key:
+            st.session_state["anthropic_api_key_input"] = typed_key
+            st.rerun()
+
+
+def github_token_setup_block(key_suffix: str = "default") -> None:
+    with st.container(border=True):
+        st.markdown("#### 🔑 GitHub 토큰이 필요해요 (기록을 계속 쌓아두려면)")
+        st.write(
+            "분석 결과를 저장하면 새로고침해도 사라지지 않고 GitHub 저장소에 "
+            "계속 쌓이도록, 쓰기 권한이 있는 개인 토큰이 하나 필요해요.\n\n"
+            "1. GitHub 우측 상단 프로필 → **Settings** → 왼쪽 맨 아래 "
+            "**Developer settings** → **Personal access tokens** → "
+            "**Fine-grained tokens** → **Generate new token**\n\n"
+            "2. Repository access: **Only select repositories** → "
+            "`macro-dashboard` 선택\n\n"
+            "3. Permissions → Repository permissions → **Contents** 를 "
+            "**Read and write** 로 변경\n\n"
+            "4. **Generate token** 클릭 → 생성된 토큰(`github_pat_...`)을 복사 "
+            "(이 화면을 벗어나면 다시 볼 수 없으니 꼭 지금 복사)\n\n"
+            "5. Streamlit Cloud 앱 관리 화면 → Settings → Secrets 에 추가:\n\n"
+            "```\nGITHUB_TOKEN = \"github_pat_여기에-실제-토큰\"\n```"
+        )
+        typed_token = st.text_input(
+            "GitHub 토큰 (임시, 이번 세션에만 사용)", type="password",
+            key=f"github_token_typed_{key_suffix}",
+        )
+        if typed_token:
+            st.session_state["github_token_input"] = typed_token
+            st.rerun()
+
+
+TOPIC_OPTIONS = [d["name"] for d in drivers.DRIVERS] + ["미국 장단기 금리차(2s10s)"]
+
 # ===== 탭 3 : 뉴스 분석 (레이어 1) =====
 with tab3:
-    st.caption(
-        "Claude API의 웹 검색 기능으로 최근 뉴스를 찾아, 선택한 요인이 왜 최근 "
-        "이렇게 움직였는지 요약합니다. 이 기능만 유일하게 비용이 드는 부분입니다."
-    )
+    news_sub1, news_sub2 = st.tabs(["🔍 최신 이슈 검색", "📋 기사 분석·저장"])
 
     stored_key = news_engine.get_stored_api_key()
 
-    if not stored_key:
-        with st.container(border=True):
-            st.markdown("#### 🔑 Anthropic API 키가 필요해요")
-            st.write(
-                "1. [console.anthropic.com](https://console.anthropic.com) 에서 계정을 만들고 "
-                "'Get API Keys' 메뉴에서 키를 발급받으세요 (`sk-ant-`로 시작).\n\n"
-                "2. Streamlit Cloud에 배포한 앱이라면, 앱 관리 화면(Manage app) → "
-                "**Settings → Secrets** 에 아래처럼 등록하면 이 입력창 없이 자동으로 "
-                "사용됩니다:\n\n"
-                "```\nANTHROPIC_API_KEY = \"sk-ant-여기에-실제-키\"\n```\n\n"
-                "3. 아니면 아래에 임시로 입력해서 지금 세션에서만 테스트해볼 수도 있어요 "
-                "(새로고침하면 사라지고, 어디에도 저장되지 않습니다)."
+    # ----- 3-1 : 주제를 고르면 웹 검색으로 최신 이슈 요약 -----
+    with news_sub1:
+        st.caption(
+            "Claude API의 웹 검색 기능으로 최근 뉴스를 찾아, 선택한 요인이 왜 최근 "
+            "이렇게 움직였는지 요약합니다."
+        )
+        if not stored_key:
+            anthropic_key_setup_block(key_suffix="search")
+        else:
+            model_label = st.selectbox("사용할 모델", list(news_engine.MODEL_OPTIONS.keys()), key="search_model")
+            model_id = news_engine.MODEL_OPTIONS[model_label]
+            topic = st.selectbox("어떤 주제의 최근 뉴스를 찾을까요?", TOPIC_OPTIONS, key="search_topic")
+
+            if st.button("🔍 최근 뉴스 요약하기", type="primary"):
+                with st.spinner("웹 검색 중... (몇 초~몇십 초 걸릴 수 있어요)"):
+                    try:
+                        summary, sources = news_engine.summarize_recent_news(
+                            topic=topic, model=model_id, api_key=stored_key
+                        )
+                    except Exception as e:
+                        st.error(
+                            f"요약을 가져오지 못했습니다: {e}\n\n"
+                            "API 키가 올바른지, 선택한 모델이 웹 검색 기능을 지원하는지 "
+                            "확인해보세요 (지원하지 않으면 다른 모델로 바꿔서 다시 시도)."
+                        )
+                    else:
+                        with st.container(border=True):
+                            st.markdown(f"#### 📰 {topic} — 최근 동향 요약")
+                            st.write(summary)
+                        if sources:
+                            st.caption("참고한 기사:")
+                            for s in sources:
+                                st.markdown(f"- [{s['title']}]({s['url']})")
+
+    # ----- 3-2 : 기사를 직접 붙여넣으면 분석 + 기록으로 저장 -----
+    with news_sub2:
+        st.caption(
+            "읽은 기사를 붙여넣으면 요약·용어정리·중요도·영향 분석·향후 시나리오까지 "
+            "정리해줘요. 저장하면 GitHub 저장소에 계속 쌓여서, 다음에 다시 열어볼 수 있어요."
+        )
+
+        if not stored_key:
+            anthropic_key_setup_block(key_suffix="article")
+        else:
+            gh_token, gh_repo = notes_store.get_config()
+
+            article_title = st.text_input("제목 (비워두면 자동으로 붙여요)", key="article_title")
+            article_text = st.text_area(
+                "기사 원문을 붙여넣으세요", height=220, key="article_text_input",
+                placeholder="여기에 기사 전문을 복사해서 붙여넣으세요...",
             )
-            typed_key = st.text_input("Anthropic API 키 (임시, 이번 세션에만 사용)", type="password")
-            if typed_key:
-                st.session_state["anthropic_api_key_input"] = typed_key
-                st.rerun()
-    else:
-        model_label = st.selectbox("사용할 모델", list(news_engine.MODEL_OPTIONS.keys()))
-        model_id = news_engine.MODEL_OPTIONS[model_label]
+            article_topic = st.selectbox("이 기사는 무엇과 관련 있나요?", TOPIC_OPTIONS, key="article_topic")
+            use_search = st.checkbox("관련 최신 뉴스도 함께 검색해서 참고하기 (비용 조금 더 듦)", key="article_use_search")
+            analyze_model_label = st.selectbox(
+                "사용할 모델", list(news_engine.MODEL_OPTIONS.keys()), key="article_model"
+            )
 
-        topic_labels = {d["name"]: d["name"] for d in drivers.DRIVERS}
-        topic_labels["미국 장단기 금리차(2s10s)"] = "미국 장단기 금리차(2s10s)"
-        topic = st.selectbox("어떤 주제의 최근 뉴스를 찾을까요?", list(topic_labels.keys()))
+            if st.button("🧠 분석하기", type="primary", disabled=not article_text.strip()):
+                with st.spinner("기사를 읽고 분석하는 중..."):
+                    try:
+                        result = news_engine.analyze_article(
+                            article_text=article_text,
+                            target_name=article_topic,
+                            model=news_engine.MODEL_OPTIONS[analyze_model_label],
+                            api_key=stored_key,
+                            use_web_search=use_search,
+                        )
+                    except Exception as e:
+                        st.error(f"분석에 실패했습니다: {e}")
+                        result = None
+                if result is not None:
+                    st.session_state["current_analysis"] = {
+                        "title": article_title.strip() or (article_text.strip()[:40] + "..."),
+                        "topic": article_topic,
+                        "article_text": article_text,
+                        **result,
+                    }
 
-        if st.button("🔍 최근 뉴스 요약하기", type="primary"):
-            with st.spinner("웹 검색 중... (몇 초~몇십 초 걸릴 수 있어요)"):
-                try:
-                    summary, sources = news_engine.summarize_recent_news(
-                        topic=topic, model=model_id, api_key=stored_key
+            analysis = st.session_state.get("current_analysis")
+            if analysis:
+                if analysis.get("_parse_error"):
+                    st.warning("모델 응답을 구조화하지 못해 원문 그대로 보여드려요.")
+
+                with st.container(border=True):
+                    st.markdown("#### 📖 요약")
+                    st.write(analysis.get("summary", ""))
+
+                if analysis.get("terms"):
+                    with st.container(border=True):
+                        st.markdown("#### 📚 용어 정리")
+                        for t in analysis["terms"]:
+                            st.markdown(f"- **{t.get('term', '')}**: {t.get('definition', '')}")
+
+                with st.container(border=True):
+                    st.markdown("#### 💡 왜 중요한가")
+                    st.write(analysis.get("why_it_matters", ""))
+
+                with st.container(border=True):
+                    st.markdown(f"#### 📊 {analysis.get('topic', '')}에 미치는 영향")
+                    st.write(analysis.get("impact_on_target", ""))
+
+                with st.container(border=True):
+                    st.markdown("#### 🔮 향후 시나리오")
+                    st.write(analysis.get("future_scenarios", ""))
+
+                my_notes = st.text_area(
+                    "📝 내 메모 (모르는 부분, 더 알아볼 것, 내 생각 등)",
+                    value=st.session_state.get("current_analysis_notes", ""),
+                    height=120,
+                    key="current_analysis_notes",
+                )
+
+                if not gh_token:
+                    st.info(
+                        "GitHub 토큰을 등록하면 이 분석 결과를 계속 쌓이는 기록으로 저장할 수 있어요. "
+                        "지금은 저장 대신 파일로 내려받아서 보관하세요."
                     )
-                except Exception as e:
-                    st.error(
-                        f"요약을 가져오지 못했습니다: {e}\n\n"
-                        "API 키가 올바른지, 선택한 모델이 웹 검색 기능을 지원하는지 "
-                        "확인해보세요 (지원하지 않으면 다른 모델로 바꿔서 다시 시도)."
+                    github_token_setup_block()
+                    export_payload = json.dumps(
+                        {**analysis, "my_notes": my_notes, "saved_at": notes_store.now_iso()},
+                        ensure_ascii=False, indent=2,
+                    )
+                    st.download_button(
+                        "💾 이 분석 결과 .json으로 저장",
+                        data=export_payload.encode("utf-8"),
+                        file_name=f"analysis_{dt.date.today().isoformat()}.json",
+                        mime="application/json",
                     )
                 else:
-                    with st.container(border=True):
-                        st.markdown(f"#### 📰 {topic} — 최근 동향 요약")
-                        st.write(summary)
-                    if sources:
-                        st.caption("참고한 기사:")
-                        for s in sources:
-                            st.markdown(f"- [{s['title']}]({s['url']})")
+                    if st.button("💾 기록에 저장하기 (GitHub)"):
+                        entry = {
+                            "id": notes_store.new_entry_id(),
+                            "created_at": notes_store.now_iso(),
+                            "title": analysis["title"],
+                            "topic": analysis.get("topic", ""),
+                            "article_text": analysis.get("article_text", "")[:5000],
+                            "summary": analysis.get("summary", ""),
+                            "terms": analysis.get("terms", []),
+                            "why_it_matters": analysis.get("why_it_matters", ""),
+                            "impact_on_target": analysis.get("impact_on_target", ""),
+                            "future_scenarios": analysis.get("future_scenarios", ""),
+                            "my_notes": my_notes,
+                        }
+                        try:
+                            with st.spinner("GitHub에 저장하는 중..."):
+                                notes_store.save_entry(gh_token, gh_repo, entry)
+                        except Exception as e:
+                            st.error(f"저장에 실패했습니다: {e}")
+                        else:
+                            st.success("저장했어요! 아래 '저장된 기록'에서 확인할 수 있어요.")
+                            st.session_state.pop("current_analysis", None)
+                            st.session_state.pop("current_analysis_notes", None)
+                            st.session_state["notes_cache"] = None
+                            st.rerun()
+
+        st.divider()
+
+        # ----- 저장된 기록 목록 -----
+        st.markdown("### 📂 저장된 기록")
+        gh_token, gh_repo = notes_store.get_config()
+        if not gh_token:
+            st.caption("GitHub 토큰을 등록하면 여기에 지금까지 쌓인 기록이 모두 나타나요.")
+        else:
+            if st.button("🔄 새로고침", key="refresh_notes"):
+                st.session_state["notes_cache"] = None
+
+            if st.session_state.get("notes_cache") is None:
+                try:
+                    st.session_state["notes_cache"] = notes_store.load_entries(gh_token, gh_repo)
+                except Exception as e:
+                    st.error(f"기록을 불러오지 못했습니다: {e}")
+                    st.session_state["notes_cache"] = []
+
+            saved_entries = st.session_state.get("notes_cache") or []
+            if not saved_entries:
+                st.caption("아직 저장된 기록이 없어요. 위에서 기사를 분석하고 저장해보세요.")
+            for entry in saved_entries:
+                header = f"{entry.get('created_at', '')[:10]} · {entry.get('title', '(제목 없음)')}"
+                with st.expander(header):
+                    st.caption(f"관련: {entry.get('topic', '')}")
+                    st.write(f"**요약**: {entry.get('summary', '')}")
+                    if entry.get("terms"):
+                        st.markdown("**용어 정리**")
+                        for t in entry["terms"]:
+                            st.markdown(f"- **{t.get('term', '')}**: {t.get('definition', '')}")
+                    st.write(f"**왜 중요한가**: {entry.get('why_it_matters', '')}")
+                    st.write(f"**영향**: {entry.get('impact_on_target', '')}")
+                    st.write(f"**향후 시나리오**: {entry.get('future_scenarios', '')}")
+                    if entry.get("my_notes"):
+                        st.write(f"**내 메모**: {entry.get('my_notes', '')}")
+                    if st.button("🗑️ 이 기록 삭제", key=f"delete_{entry.get('id')}"):
+                        try:
+                            notes_store.delete_entry(gh_token, gh_repo, entry["id"])
+                        except Exception as e:
+                            st.error(f"삭제에 실패했습니다: {e}")
+                        else:
+                            st.session_state["notes_cache"] = None
+                            st.rerun()
 
 # ===== 탭 4 : 예시·기록 =====
 with tab4:
